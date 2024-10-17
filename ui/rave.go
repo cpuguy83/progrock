@@ -1,24 +1,16 @@
 package ui
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"os"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fogleman/ease"
 	"github.com/muesli/termenv"
-	"github.com/pkg/browser"
-	"github.com/zmb3/spotify/v2"
-	spotifyauth "github.com/zmb3/spotify/v2/auth"
-	"golang.org/x/oauth2"
 )
 
 type Spinner interface {
@@ -32,38 +24,30 @@ type Rave struct {
 	// Show extra details useful for debugging a desynced rave.
 	ShowDetails bool
 
-	// Address (host:port) on which to listen for auth callbacks.
-	AuthCallbackAddr string
-
-	// Configuration for syncing with Spotify.
-	SpotifyAuth *spotifyauth.Authenticator
-
-	// File path where tokens will be cached.
-	SpotifyTokenPath string
-
 	// The animation to display.
 	Frames SpinnerFrames
 
 	// color profile configured at start (to respect NO_COLOR etc)
 	colorProfile termenv.Profile
 
-	// transmits an authenticated Spotify client during the auth callback flow
-	spotifyAuthState    string
-	spotifyAuthVerifier string
-	spotifyAuthCh       chan *spotify.Client
-
 	// the sequence to visualize
 	start time.Time
-	marks []spotify.Marker
+	marks []marker
 
 	// syncing along to music
-	track *spotify.FullTrack
+	track *track
 
 	// refresh rate
 	fps float64
 
 	// current position in the marks sequence
 	pos int
+}
+
+type marker struct {
+	Start      float64 `json:"start"`
+	Duration   float64 `json:"duration"`
+	Confidence float64 `json:"confidence"`
 }
 
 var _ Spinner = &Rave{}
@@ -108,10 +92,7 @@ var MiniDotFrames = SpinnerFrames{
 
 func NewRave() *Rave {
 	r := &Rave{
-		Frames: MeterFrames,
-
-		spotifyAuthCh: make(chan *spotify.Client),
-
+		Frames:       MeterFrames,
 		colorProfile: ColorProfile(),
 	}
 
@@ -122,7 +103,7 @@ func NewRave() *Rave {
 
 func (rave *Rave) reset() {
 	rave.start = time.Now()
-	rave.marks = []spotify.Marker{
+	rave.marks = []marker{
 		{
 			Start:    0,
 			Duration: 60.0 / DefaultBPM,
@@ -132,73 +113,18 @@ func (rave *Rave) reset() {
 	rave.pos = 0
 }
 
-type authed struct {
-	tok *oauth2.Token
-}
-
 func (rave *Rave) Init() tea.Cmd {
-	ctx := context.TODO()
-
 	cmds := []tea.Cmd{
 		Frame(rave.fps),
 		rave.setFPS(DefaultBPM),
 		func() tea.Msg {
-			client, err := rave.existingAuth(ctx)
-			if err == nil {
-				return rave.sync(ctx, client)
-			}
-
 			return nil
 		},
-	}
-
-	if rave.AuthCallbackAddr != "" {
-		var err error
-		rave.spotifyAuthState, err = b64rand(16)
-		if err != nil {
-			cmds = append(cmds, tea.Printf("failed to generate auth state: %s", err))
-			return tea.Batch(cmds...)
-		}
-
-		rave.spotifyAuthVerifier, err = b64rand(64)
-		if err != nil {
-			cmds = append(cmds, tea.Printf("failed to generate verifier: %s", err))
-			return tea.Batch(cmds...)
-		}
-
-		mux := http.NewServeMux()
-		mux.HandleFunc("/auth/spotify", func(w http.ResponseWriter, r *http.Request) {
-			tok, err := rave.SpotifyAuth.Token(r.Context(), rave.spotifyAuthState, r,
-				oauth2.SetAuthURLParam("code_verifier", rave.spotifyAuthVerifier))
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to get token: %s", err), http.StatusForbidden)
-				return
-			}
-
-			if st := r.FormValue("state"); st != rave.spotifyAuthState {
-				http.Error(w, fmt.Sprintf("bad state: %s != %s", st, rave.spotifyAuthState), http.StatusForbidden)
-				return
-			}
-
-			err = rave.saveToken(tok)
-			if err != nil {
-				http.Error(w, fmt.Sprintf("failed to save token: %s", err), http.StatusInternalServerError)
-				return
-			}
-
-			rave.spotifyAuthCh <- spotify.New(rave.SpotifyAuth.Client(r.Context(), tok))
-		})
-
-		go http.ListenAndServe(rave.AuthCallbackAddr, mux)
 	}
 
 	return tea.Batch(
 		cmds...,
 	)
-}
-
-func (rave *Rave) SpotifyCallbackURL() string {
-	return "http://" + rave.AuthCallbackAddr + "/auth/spotify"
 }
 
 func (rave *Rave) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -390,142 +316,44 @@ func (sched *Rave) Progress(now time.Time) (int, float64) {
 	return -1, 0
 }
 
-func (rave *Rave) spotifyAuth(ctx context.Context) (*spotify.Client, error) {
-	if rave.SpotifyAuth == nil {
-		return nil, fmt.Errorf("no auth configured")
-	}
-
-	if client, err := rave.existingAuth(ctx); err == nil {
-		// user has authenticated previously, no need for auth flow
-		return client, nil
-	}
-
-	codeChallenge := b64s256([]byte(rave.spotifyAuthVerifier))
-
-	authURL := rave.SpotifyAuth.AuthURL(rave.spotifyAuthState,
-		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-		oauth2.SetAuthURLParam("code_challenge", codeChallenge),
-	)
-
-	if err := browser.OpenURL(authURL); err != nil {
-		return nil, fmt.Errorf("open browser: %w", err)
-	}
-
-	select {
-	case client, ok := <-rave.spotifyAuthCh:
-		if !ok {
-			return nil, fmt.Errorf("callback error")
-		}
-
-		return client, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (m *Rave) existingAuth(ctx context.Context) (*spotify.Client, error) {
-	if m.SpotifyAuth == nil || m.SpotifyTokenPath == "" {
-		return nil, fmt.Errorf("no auth configured")
-	}
-
-	content, err := os.ReadFile(m.SpotifyTokenPath)
-	if err != nil {
-		return nil, err
-	}
-
-	var tok *oauth2.Token
-	if err := json.Unmarshal(content, &tok); err != nil {
-		return nil, err
-	}
-
-	client := spotify.New(m.SpotifyAuth.Client(ctx, tok))
-
-	// check if the token is still valid and/or refresh
-	refresh, err := client.Token()
-	if err != nil {
-		return nil, err
-	}
-
-	// save new token if refreshed
-	if refresh.AccessToken != tok.AccessToken {
-		err = m.saveToken(refresh)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return client, nil
-}
-
 func (m *Rave) Sync() tea.Cmd {
-	ctx := context.TODO()
-
 	return func() tea.Msg {
-		client, err := m.spotifyAuth(ctx)
-		if err != nil {
-			return tea.Println("failed to authenticate:", err)
-		}
-
-		return m.sync(ctx, client)
+		return nil
 	}
 }
 
 func (m *Rave) Desync() tea.Cmd {
-	if m.SpotifyTokenPath != "" {
-		_ = os.Remove(m.SpotifyTokenPath)
-	}
-
 	m.reset()
-
 	return nil
 }
 
+type currentlyPlaying struct {
+	Timestamp int64
+	Item      *track `json:"item"`
+}
+
+type analysis struct {
+	Beats []marker
+	Track *track
+}
+
+type track struct {
+	Tempo   float64
+	Name    string
+	Artists []artist
+}
+
+type artist struct {
+	Name string
+}
+
 type syncedMsg struct {
-	playing  *spotify.CurrentlyPlaying
-	analysis *spotify.AudioAnalysis
+	playing  *currentlyPlaying
+	analysis *analysis
 }
 
 type syncErrMsg struct {
 	err error
-}
-
-func (m *Rave) sync(ctx context.Context, client *spotify.Client) tea.Msg {
-	playing, err := client.PlayerCurrentlyPlaying(ctx)
-	if err != nil {
-		return syncErrMsg{fmt.Errorf("get currently playing: %w", err)}
-	}
-
-	if playing.Item == nil {
-		return syncedMsg{} // no song playing
-	}
-
-	analysis, err := client.GetAudioAnalysis(ctx, playing.Item.ID)
-	if err != nil {
-		return syncErrMsg{fmt.Errorf("failed to get audio analysis: %w", err)}
-	}
-
-	return syncedMsg{
-		playing:  playing,
-		analysis: analysis,
-	}
-}
-
-func (m *Rave) saveToken(tok *oauth2.Token) error {
-	if m.SpotifyTokenPath == "" {
-		return nil
-	}
-
-	payload, err := json.Marshal(tok)
-	if err != nil {
-		return err
-	}
-
-	_ = os.WriteFile(m.SpotifyTokenPath, payload, 0600)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func b64s256(val []byte) string {
