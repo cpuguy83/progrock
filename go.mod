@@ -1,8 +1,6 @@
 module github.com/vito/progrock
 
-go 1.21
-
-toolchain go1.21.3
+go 1.23.0
 
 require (
 	github.com/charmbracelet/bubbles v0.16.1
@@ -20,10 +18,10 @@ require (
 	github.com/vito/midterm v0.1.4
 	github.com/zmb3/spotify/v2 v2.3.1
 	golang.org/x/exp v0.0.0-20230425010034-47ecfdc1ba53
-	golang.org/x/oauth2 v0.7.0
+	golang.org/x/oauth2 v0.27.0
 	golang.org/x/term v0.13.0
-	google.golang.org/grpc v1.55.0
-	google.golang.org/protobuf v1.31.0
+	google.golang.org/grpc v1.56.3
+	google.golang.org/protobuf v1.33.0
 )
 
 require (
@@ -48,7 +46,6 @@ require (
 	golang.org/x/sync v0.3.0 // indirect
 	golang.org/x/sys v0.14.0 // indirect
 	golang.org/x/text v0.13.0 // indirect
-	google.golang.org/appengine v1.6.7 // indirect
-	google.golang.org/genproto v0.0.0-20230306155012-7f2fa6fef1f4 // indirect
+	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
